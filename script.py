@@ -3,7 +3,7 @@ import ssl
 
 # مشخص کردن نام دامنه و آدرس IP سرور
 domain = "snap.ir"
-ip_address = "127.0.0.1"
+ip_address = "185.143.234.3" # آدرس IP snap.ir
 
 # ایجاد یک اتصال SSL
 context = ssl.create_default_context()
