@@ -1,39 +1,19 @@
 import socket
 import threading
-import os
-import json
 import time
+import json
 import urllib.request
 
-import pydivert
-
-# ===================== تنظیمات =====================
 LISTEN_HOST = '127.0.0.1'
 LISTEN_PORT = 8080
 
-FAKE_SNI = b"snapp.ir"      # SNI جعلی (ثابت)
-FAKE_MODE = "badsum"        # "badsum" یا "ttl"
-FAKE_TTL = 5                # فقط برای حالت ttl (3 تا 10)
-FAKE_REPEAT = 1             # تعداد بستهٔ جعلی (1 تا 3)
+SPLIT_DELAY = 0.05     # اگر کار نکرد 0.1 تا 0.3 را امتحان کن
+FRAG_COUNT = 2         # تعداد تکه (2 یا 3)
 
-SPLIT_REAL = True           # شکستن ClientHello واقعی وسط SNI
-SEND_FAKE_TO_SNAPP = False  # بستهٔ جعلی با مقصد IP اسنپ (آزمایشی)
-
-BYPASS_ALL = False          # True = روی همهٔ سایت‌ها اعمال شود
-DPI_DOMAINS = (
-    'google.com', 'youtube.com', 'ytimg.com', 'ggpht.com',
-    'googleusercontent.com', 'gstatic.com', 'googleapis.com',
-    'youtu.be', 'googlevideo.com',
-    # دامنه‌های فیلترشدهٔ دیگر را اینجا اضافه کن
-)
-
-CLEAN_IPS = {}              # مثال: {'google.com': '142.250.185.228'}
+CLEAN_IPS = {}         # مثلا {'google.com': '142.250.185.228'} اگر لازم شد
 DEBUG = True
-# ====================================================
 
 DNS_CACHE = {}
-ACTIVE_PORTS = set()
-LOCK = threading.Lock()
 
 
 def log(*a):
@@ -41,14 +21,6 @@ def log(*a):
         print(*a, flush=True)
 
 
-def needs_bypass(host):
-    if BYPASS_ALL:
-        return True
-    host = host.lower()
-    return any(host == d or host.endswith('.' + d) for d in DPI_DOMAINS)
-
-
-# ---------- DNS ----------
 def resolve_ip(host):
     for key, ip in CLEAN_IPS.items():
         if host == key or host.endswith('.' + key):
@@ -74,36 +46,31 @@ def resolve_ip(host):
         return None
 
 
-# ---------- ClientHello جعلی با SNI اسنپ ----------
-def _ext(t, data):
-    return t.to_bytes(2, 'big') + len(data).to_bytes(2, 'big') + data
+def recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            break
+        buf += chunk
+    return buf
 
 
-def build_fake_tls_hello(sni):
-    n = len(sni)
-    sni_ext = _ext(0, (n + 3).to_bytes(2, 'big') + b"\x00" + n.to_bytes(2, 'big') + sni)
-    groups = _ext(10, b"\x00\x06\x00\x1d\x00\x17\x00\x18")
-    sigalgs = _ext(13, b"\x00\x08\x04\x03\x08\x04\x04\x01\x05\x03")
-    versions = _ext(43, b"\x04\x03\x04\x03\x03")
-    exts = sni_ext + groups + sigalgs + versions
-
-    ciphers = b"\x13\x01\x13\x02\x13\x03\xc0\x2b\xc0\x2f\xc0\x2c\xc0\x30"
-    body = (
-        b"\x03\x03" + os.urandom(32) +
-        b"\x20" + os.urandom(32) +
-        len(ciphers).to_bytes(2, 'big') + ciphers +
-        b"\x01\x00" +
-        len(exts).to_bytes(2, 'big') + exts
-    )
-    hs = b"\x01" + len(body).to_bytes(3, 'big') + body
-    return b"\x16\x03\x01" + len(hs).to_bytes(2, 'big') + hs
+def read_client_hello(sock):
+    """کل رکورد اول TLS (ClientHello) را می‌خواند، حتی اگر چند بسته TCP باشد"""
+    hdr = recv_exact(sock, 5)
+    if len(hdr) < 5:
+        return hdr
+    if hdr[0] != 0x16:
+        # غیر TLS: هرچه در دسترس است را برگردان
+        return hdr + sock.recv(16384)
+    rec_len = int.from_bytes(hdr[3:5], 'big')
+    body = recv_exact(sock, rec_len)
+    return hdr + body
 
 
-FAKE_HELLO = build_fake_tls_hello(FAKE_SNI)
-
-
-# ---------- پیدا کردن SNI واقعی ----------
-def find_sni_offset(data):
+def find_sni(data):
+    """offset و طول نام دامنه در ClientHello، یا None"""
     try:
         pos = 5 + 4 + 2 + 32
         pos += 1 + data[pos]
@@ -123,83 +90,45 @@ def find_sni_offset(data):
     return None
 
 
-# ---------- تزریق با WinDivert ----------
-def clone(pkt):
-    return pydivert.Packet(bytearray(pkt.raw), pkt.interface, pkt.direction)
+def fragment_hello(data, n_parts):
+    """ClientHello را به n_parts رکورد TLS کوچک می‌شکند، برش از وسط SNI"""
+    rec_len = int.from_bytes(data[3:5], 'big')
+    payload = data[5:5 + rec_len]
+    rest = data[5 + rec_len:]
 
-
-def inject_fake(w, pkt, dst_ip=None):
-    fake = clone(pkt)
-    fake.tcp.payload = FAKE_HELLO       # seq/ack/پورت‌ها همان بستهٔ واقعی
-    if dst_ip:
-        fake.dst_addr = dst_ip
-    if FAKE_MODE == "ttl":
-        fake.ipv4.ttl = FAKE_TTL
-        w.send(fake)
+    sni = find_sni(data)
+    if sni:
+        off, name_len = sni
+        center = (off - 5) + name_len // 2
+        step = max(1, name_len // max(1, n_parts))
+        raw_cuts = [center + (i - n_parts // 2) * step for i in range(n_parts)]
     else:
-        fake.recalculate_checksums()
-        fake.tcp.cksum = (fake.tcp.cksum + 1) & 0xFFFF
-        w.send(fake, recalculate_checksum=False)
+        raw_cuts = [len(payload) // 2]
+
+    cuts = sorted(set(c for c in raw_cuts if 0 < c < len(payload)))
+
+    records = []
+    prev = 0
+    for c in cuts:
+        chunk = payload[prev:c]
+        if chunk:
+            records.append(data[:3] + len(chunk).to_bytes(2, 'big') + chunk)
+        prev = c
+    last = payload[prev:]
+    if last:
+        records.append(data[:3] + len(last).to_bytes(2, 'big') + last + rest)
+    else:
+        records[-1] = records[-1] + rest
+    return records
 
 
-def send_split(w, pkt, split_at):
-    payload = bytes(pkt.tcp.payload)
-    if split_at <= 0 or split_at >= len(payload):
-        w.send(pkt)
-        return
-    p1 = clone(pkt)
-    p1.tcp.payload = payload[:split_at]
-    w.send(p1)
-
-    p2 = clone(pkt)
-    p2.tcp.seq_num = (pkt.tcp.seq_num + split_at) & 0xFFFFFFFF
-    p2.tcp.payload = payload[split_at:]
-    w.send(p2)
-
-
-def divert_loop(snapp_ip):
-    flt = "outbound and ip and tcp.DstPort == 443 and tcp.PayloadLength > 0"
-    with pydivert.WinDivert(flt) as w:
-        log(f"[*] WinDivert active | fake_sni={FAKE_SNI.decode()} "
-            f"mode={FAKE_MODE} ttl={FAKE_TTL} split={SPLIT_REAL}")
-        for pkt in w:
-            handled = False
-            try:
-                with LOCK:
-                    mine = pkt.src_port in ACTIVE_PORTS
-                p = bytes(pkt.tcp.payload)
-                if mine and len(p) > 6 and p[0] == 0x16 and p[5] == 0x01 \
-                        and FAKE_SNI not in p:
-                    for _ in range(FAKE_REPEAT):
-                        inject_fake(w, pkt)
-                    if SEND_FAKE_TO_SNAPP and snapp_ip:
-                        inject_fake(w, pkt, dst_ip=snapp_ip)
-
-                    if SPLIT_REAL:
-                        sni = find_sni_offset(p)
-                        cut = (sni[0] + max(1, sni[1] // 2)) if sni else 5
-                        send_split(w, pkt, cut)
-                        handled = True
-                    log(f"[+] fake SNI={FAKE_SNI.decode()} injected"
-                        f"{' + split' if SPLIT_REAL else ''}"
-                        f" -> {pkt.dst_addr}:{pkt.dst_port}")
-            except Exception as e:
-                log(f"[!] inject error: {type(e).__name__}: {e}")
-            if not handled:
-                try:
-                    w.send(pkt)
-                except Exception as e:
-                    log(f"[!] send error: {e}")
-
-
-# ---------- پروکسی ----------
 def pipe(src, dst):
     try:
         while True:
-            data = src.recv(16384)
-            if not data:
+            d = src.recv(16384)
+            if not d:
                 break
-            dst.sendall(data)
+            dst.sendall(d)
     except Exception:
         pass
     finally:
@@ -221,7 +150,6 @@ def recv_headers(sock):
 
 
 def handle_plain_http(client, req):
-    """درخواست HTTP ساده (غیر CONNECT) را مستقیم فوروارد می‌کند"""
     r = None
     try:
         hdr = req.decode('latin1')
@@ -234,7 +162,6 @@ def handle_plain_http(client, req):
         if not ip:
             return
         r = socket.create_connection((ip, int(pp or 80)), timeout=8)
-        r.settimeout(None)
         r.sendall(req)
         threading.Thread(target=pipe, args=(client, r), daemon=True).start()
         pipe(r, client)
@@ -251,7 +178,6 @@ def handle_plain_http(client, req):
 
 def handle_client(client):
     remote = None
-    local_port = None
     try:
         req = recv_headers(client)
         if not req:
@@ -271,37 +197,36 @@ def handle_client(client):
 
         remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         remote.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        remote.bind(('', 0))                       # پورت را قبل از connect بگیر
-        local_port = remote.getsockname()[1]
-        bypass = needs_bypass(host)
-        if bypass:
-            with LOCK:
-                ACTIVE_PORTS.add(local_port)
-
         remote.settimeout(8)
         remote.connect((ip, int(port)))
         remote.settimeout(None)
-        log(f"[+] connected {host} {ip} port={local_port} "
-            f"{'[BYPASS]' if bypass else '[direct]'}")
+        log(f"[+] connected {host} {ip}")
 
         client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
 
-        first_data = client.recv(16384)
-        if first_data:
-            remote.sendall(first_data)             # WinDivert اینجا دستکاری می‌کند
+        first_data = read_client_hello(client)
+        if not first_data:
+            client.close()
+            remote.close()
+            return
+
+        if first_data[0] == 0x16 and len(first_data) > 5 and first_data[5] == 0x01:
+            parts = fragment_hello(first_data, FRAG_COUNT)
+            for i, part in enumerate(parts):
+                remote.sendall(part)
+                if i < len(parts) - 1:
+                    time.sleep(SPLIT_DELAY)
+            log(f"[+] fragmented ClientHello ({len(parts)} parts) -> {host}")
+        else:
+            remote.sendall(first_data)
 
         t1 = threading.Thread(target=pipe, args=(client, remote), daemon=True)
         t2 = threading.Thread(target=pipe, args=(remote, client), daemon=True)
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
+        t1.start(); t2.start()
+        t1.join(); t2.join()
     except Exception as e:
         log(f"[!] handle_client error: {type(e).__name__}: {e}")
     finally:
-        if local_port is not None:
-            with LOCK:
-                ACTIVE_PORTS.discard(local_port)
         for s in (client, remote):
             try:
                 if s:
@@ -311,15 +236,11 @@ def handle_client(client):
 
 
 def main():
-    snapp_ip = resolve_ip("snapp.ir") if SEND_FAKE_TO_SNAPP else None
-    threading.Thread(target=divert_loop, args=(snapp_ip,), daemon=True).start()
-    time.sleep(0.5)
-
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((LISTEN_HOST, LISTEN_PORT))
     srv.listen(200)
-    log(f"[*] Proxy on {LISTEN_HOST}:{LISTEN_PORT} | fake SNI = {FAKE_SNI.decode()}")
+    log(f"[*] SNI-fragment proxy on {LISTEN_HOST}:{LISTEN_PORT}")
     while True:
         c, _ = srv.accept()
         threading.Thread(target=handle_client, args=(c,), daemon=True).start()
