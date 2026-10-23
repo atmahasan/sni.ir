@@ -2,32 +2,18 @@ import socket
 import ssl
 
 # مشخص کردن نام دامنه و آدرس IP سرور
-domain = "snap.ir"
-ip_address = "185.143.234.3" # آدرس IP snap.ir
+دامنه = "snap.ir"
+آدرس_آی‌پی = socket.gethostbyname(دامنه)
 
-# ایجاد یک اتصال SSL
+# ایجاد یک اتصال اس‌اس‌ال به سرور
 context = ssl.create_default_context()
 context.check_hostname = False
 context.verify_mode = ssl.CERT_NONE
 
-# ایجاد یک سوکت
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-# اتصال به سرور
-sock.connect((ip_address, 443))
-
-# ایجاد یک اتصال SSL
-ssl_sock = context.wrap_socket(sock, server_hostname=domain)
-
-# ارسال درخواست SNI
-ssl_sock.sendall(b"GET / HTTP/1.1\r\nHost: " + domain.encode() + b"\r\n\r\n")
-
-# دریافت پاسخ
-response = ssl_sock.recv(1024)
-
-# چاپ پاسخ
-print(response.decode())
-
-# بستن اتصال
-ssl_sock.close()
-sock.close()
+with socket.create_connection((آدرس_آی‌پی, 443)) as sock:
+ with context.wrap_socket(sock, server_hostname=دامنه) as ssock:
+ # ارسال یک درخواست GET به صفحه اصلی
+ request = f"GET / HTTP/1.1\r\nHost: {دامنه}\r\n\r\n"
+ ssock.sendall(request.encode())
+ response = ssock.recv(1024)
+ print(response.decode())
