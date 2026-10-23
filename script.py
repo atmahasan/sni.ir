@@ -1,53 +1,33 @@
-import requests
-import iptables
-import snort
+import socket
 import ssl
-import dns.resolver
 
-# تنظیم پراکسی روی مرورگر
-def set_proxy():
- proxy_url = "http://snap.ir:8080"
- proxies = {"http": proxy_url, "https": proxy_url}
- return proxies
+# مشخص کردن نام دامنه و آدرس IP سرور
+domain = "snap.ir"
+ip_address = "93.184.216.34"
 
-# استفاده از سیستم‌های مدیریت ترافیک شبکه
-def set_firewall():
- iptables_rule = "-A INPUT -p tcp --dport 80 -j DROP"
- iptables.cmd(iptables_rule)
+# ایجاد یک اتصال SSL
+context = ssl.create_default_context()
+context.check_hostname = False
+context.verify_mode = ssl.CERT_NONE
 
-# استفاده از سیستم‌های تشخیص و پیشگیری از نفوذ
-def set_ids():
- snort_rule = "alert tcp any any -> any 80 (msg:'SNI Spoof'; sid:1000001;)"
- snort.cmd(snort_rule)
+# ایجاد یک سوکت
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-# استفاده از روش‌های رمزگذاری ترافیک شبکه
-def set_ssl():
- ssl_context = ssl.create_default_context()
- ssl_context.check_hostname = True
- ssl_context.verify_mode = ssl.CERT_REQUIRED
- return ssl_context
+# اتصال به سرور
+sock.connect((ip_address, 443))
 
-# استفاده از سیستم‌های مدیریت نام دامنه
-def set_dns():
- dns_resolver = dns.resolver.Resolver()
- dns_resolver.nameservers = ["8.8.8.8"]
- return dns_resolver
+# ایجاد یک اتصال SSL
+ssl_sock = context.wrap_socket(sock, server_hostname=domain)
 
-# اسکریپت اصلی
-def main():
- proxies = set_proxy()
- set_firewall()
- set_ids()
- ssl_context = set_ssl()
- dns_resolver = set_dns()
+# ارسال درخواست SNI
+ssl_sock.sendall(b"GET / HTTP/1.1\r\nHost: " + domain.encode() + b"\r\n\r\n")
 
- url = "https://example.com"
- response = requests.get(url, proxies=proxies, verify=ssl_context)
+# دریافت پاسخ
+response = ssl_sock.recv(1024)
 
- if response.status_code == 200:
- print("وب‌سایت مورد نظر با موفقیت بارگیری شد.")
- else:
- print("خطایی در بارگیری وب‌سایت رخ داد.")
+# چاپ پاسخ
+print(response.decode())
 
-if __name__ == "__main__":
- main()
+# بستن اتصال
+ssl_sock.close()
+sock.close()
