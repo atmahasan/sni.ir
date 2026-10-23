@@ -7,13 +7,15 @@ import urllib.request
 LISTEN_HOST = '127.0.0.1'
 LISTEN_PORT = 8080
 
-SPLIT_DELAY = 0.05     # اگر کار نکرد 0.1 تا 0.3 را امتحان کن
-FRAG_COUNT = 2         # تعداد تکه (2 یا 3)
+SPLIT_DELAY = 0.05      # اگر کار نکرد 0.1 تا 0.3 را امتحان کن
+FRAG_COUNT = 2          # تعداد تکه (2 یا 3)
+FAKE_SNI = ''           # مثلا 'snap.ir' ؛ '' یعنی غیرفعال
 
-CLEAN_IPS = {}         # مثلا {'google.com': '142.250.185.228'} اگر لازم شد
+CLEAN_IPS = {}          # مثلا {'google.com': '142.250.185.228'}
 DEBUG = True
 
 DNS_CACHE = {}
+DOH_ENABLED = True
 
 
 def log(*a):
@@ -21,22 +23,27 @@ def log(*a):
         print(*a, flush=True)
 
 
+# ---------------- DNS ----------------
+
 def resolve_ip(host):
+    global DOH_ENABLED
     for key, ip in CLEAN_IPS.items():
         if host == key or host.endswith('.' + key):
             return ip
     if host in DNS_CACHE:
         return DNS_CACHE[host]
-    try:
-        url = f"https://1.1.1.1/dns-query?name={host}&type=A"
-        req = urllib.request.Request(url, headers={'Accept': 'application/dns-json'})
-        with urllib.request.urlopen(req, timeout=5) as res:
-            for ans in json.loads(res.read().decode()).get('Answer', []):
-                if ans.get('type') == 1:
-                    DNS_CACHE[host] = ans['data']
-                    return ans['data']
-    except Exception as e:
-        log(f"[!] DoH failed for {host}: {e}")
+    if DOH_ENABLED:
+        try:
+            url = f"https://1.1.1.1/dns-query?name={host}&type=A"
+            req = urllib.request.Request(url, headers={'Accept': 'application/dns-json'})
+            with urllib.request.urlopen(req, timeout=2) as res:
+                for ans in json.loads(res.read().decode()).get('Answer', []):
+                    if ans.get('type') == 1:
+                        DNS_CACHE[host] = ans['data']
+                        return ans['data']
+        except Exception as e:
+            DOH_ENABLED = False
+            log(f"[!] DoH disabled (blocked?): {e}")
     try:
         ip = socket.gethostbyname(host)
         DNS_CACHE[host] = ip
@@ -45,6 +52,8 @@ def resolve_ip(host):
         log(f"[!] DNS failed for {host}: {e}")
         return None
 
+
+# ---------------- خواندن ClientHello ----------------
 
 def recv_exact(sock, n):
     buf = b""
@@ -57,17 +66,18 @@ def recv_exact(sock, n):
 
 
 def read_client_hello(sock):
-    """کل رکورد اول TLS (ClientHello) را می‌خواند، حتی اگر چند بسته TCP باشد"""
+    """کل رکورد اول TLS (ClientHello) را می‌خواند"""
     hdr = recv_exact(sock, 5)
     if len(hdr) < 5:
         return hdr
     if hdr[0] != 0x16:
-        # غیر TLS: هرچه در دسترس است را برگردان
         return hdr + sock.recv(16384)
     rec_len = int.from_bytes(hdr[3:5], 'big')
     body = recv_exact(sock, rec_len)
     return hdr + body
 
+
+# ---------------- SNI ----------------
 
 def find_sni(data):
     """offset و طول نام دامنه در ClientHello، یا None"""
@@ -89,6 +99,37 @@ def find_sni(data):
         pass
     return None
 
+
+def set_sni(data, new_name):
+    """نام SNI را عوض می‌کند و طول‌های والد (extension, list, handshake, record) را اصلاح می‌کند"""
+    sni = find_sni(data)
+    if not sni:
+        return data
+    off, old_len = sni
+    nb = new_name.encode()
+    delta = len(nb) - old_len
+    b = bytearray(data)
+    ext = off - 9                       # شروع extension سرور-نیم
+
+    b[off - 2:off] = len(nb).to_bytes(2, 'big')     # طول نام
+    b[off:off + old_len] = nb                       # خود نام
+
+    # extension length
+    v = int.from_bytes(b[ext + 2:ext + 4], 'big') + delta
+    b[ext + 2:ext + 4] = v.to_bytes(2, 'big')
+    # server_name_list length
+    v = int.from_bytes(b[ext + 4:ext + 6], 'big') + delta
+    b[ext + 4:ext + 6] = v.to_bytes(2, 'big')
+    # handshake length (3 بایت)
+    v = int.from_bytes(b[6:9], 'big') + delta
+    b[6:9] = v.to_bytes(3, 'big')
+    # record length
+    v = int.from_bytes(b[3:5], 'big') + delta
+    b[3:5] = v.to_bytes(2, 'big')
+    return bytes(b)
+
+
+# ---------------- تکه‌کردن ----------------
 
 def fragment_hello(data, n_parts):
     """ClientHello را به n_parts رکورد TLS کوچک می‌شکند، برش از وسط SNI"""
@@ -121,6 +162,8 @@ def fragment_hello(data, n_parts):
         records[-1] = records[-1] + rest
     return records
 
+
+# ---------------- پروکسی ----------------
 
 def pipe(src, dst):
     try:
@@ -204,13 +247,18 @@ def handle_client(client):
 
         client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
 
+        client.settimeout(10)
         first_data = read_client_hello(client)
+        client.settimeout(None)
         if not first_data:
             client.close()
             remote.close()
             return
 
-        if first_data[0] == 0x16 and len(first_data) > 5 and first_data[5] == 0x01:
+        if len(first_data) > 5 and first_data[0] == 0x16 and first_data[5] == 0x01:
+            if FAKE_SNI:
+                first_data = set_sni(first_data, FAKE_SNI)
+                log(f"[*] SNI replaced with {FAKE_SNI} for {host}")
             parts = fragment_hello(first_data, FRAG_COUNT)
             for i, part in enumerate(parts):
                 remote.sendall(part)
@@ -218,12 +266,17 @@ def handle_client(client):
                     time.sleep(SPLIT_DELAY)
             log(f"[+] fragmented ClientHello ({len(parts)} parts) -> {host}")
         else:
+            log(f"[?] not ClientHello for {host}, first bytes: {first_data[:8].hex()}")
             remote.sendall(first_data)
 
         t1 = threading.Thread(target=pipe, args=(client, remote), daemon=True)
         t2 = threading.Thread(target=pipe, args=(remote, client), daemon=True)
-        t1.start(); t2.start()
-        t1.join(); t2.join()
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+    except (ConnectionAbortedError, ConnectionResetError, socket.timeout):
+        pass  # قطع اتصال از سمت مرورگر، معمولاً طبیعی است
     except Exception as e:
         log(f"[!] handle_client error: {type(e).__name__}: {e}")
     finally:
