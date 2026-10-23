@@ -1,43 +1,53 @@
-import socket
+import requests
+import iptables
+import snort
 import ssl
-import scapy.all as scapy
+import dns.resolver
 
-# مشخص کردن آدرس و پورت وب‌سایت مورد نظر
-target_host = 'snap.ir'
-target_port = 443
+# تنظیم پراکسی روی مرورگر
+def set_proxy():
+ proxy_url = "http://snap.ir:8080"
+ proxies = {"http": proxy_url, "https": proxy_url}
+ return proxies
 
-# ایجاد یک سوکت
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+# استفاده از سیستم‌های مدیریت ترافیک شبکه
+def set_firewall():
+ iptables_rule = "-A INPUT -p tcp --dport 80 -j DROP"
+ iptables.cmd(iptables_rule)
 
-# اتصال به وب‌سایت مورد نظر
-sock.connect((target_host, target_port))
+# استفاده از سیستم‌های تشخیص و پیشگیری از نفوذ
+def set_ids():
+ snort_rule = "alert tcp any any -> any 80 (msg:'SNI Spoof'; sid:1000001;)"
+ snort.cmd(snort_rule)
 
-# ایجاد یک контکست SSL
-context = ssl.create_default_context()
+# استفاده از روش‌های رمزگذاری ترافیک شبکه
+def set_ssl():
+ ssl_context = ssl.create_default_context()
+ ssl_context.check_hostname = True
+ ssl_context.verify_mode = ssl.CERT_REQUIRED
+ return ssl_context
 
-# تنظیم نام دامنه جعلی
-fake_domain = 'snap.ir'
+# استفاده از سیستم‌های مدیریت نام دامنه
+def set_dns():
+ dns_resolver = dns.resolver.Resolver()
+ dns_resolver.nameservers = ["8.8.8.8"]
+ return dns_resolver
 
-# ارسال درخواست به وب‌سایت مورد نظر
-sock.sendall(f'GET / HTTP/1.1\r\nHost: {fake_domain}\r\n\r\n'.encode())
+# اسکریپت اصلی
+def main():
+ proxies = set_proxy()
+ set_firewall()
+ set_ids()
+ ssl_context = set_ssl()
+ dns_resolver = set_dns()
 
-# دریافت پاسخ از وب‌سایت مورد نظر
-response = sock.recv(1024)
+ url = "https://example.com"
+ response = requests.get(url, proxies=proxies, verify=ssl_context)
 
-# چاپ پاسخ
-print(response.decode())
+ if response.status_code == 200:
+ print("وب‌سایت مورد نظر با موفقیت بارگیری شد.")
+ else:
+ print("خطایی در بارگیری وب‌سایت رخ داد.")
 
-# بستن سوکت
-sock.close()
-
-# مشخص کردن آدرس IP وب‌سایت جعلی
-fake_ip = '192.168.1.100'
-
-# مشخص کردن نام دامنه وب‌سایت مورد نظر
-target_domain = 'snap.ir'
-
-# ایجاد یک پکت DNS
-packet = scapy.IP(dst='192.168.1.1')/scapy.UDP(dport=53)/scapy.DNS(rd=1, qd=scapy.DNSQR(qname=target_domain, qtype='A'), an=scapy.DNSRR(rrname=target_domain, type='A', rdata=fake_ip, ttl=123))
-
-# ارسال پکت DNS
-scapy.send(packet)
+if __name__ == "__main__":
+ main()
